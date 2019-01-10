@@ -1,0 +1,102 @@
+library(stringr)
+library(dplyr)
+library(readxl)
+library(data.table)
+
+#Build PTM library from experiment
+#Define glycounit mass and other PTM mass
+glycounitMass <- c("N"=203.1950, "H"=162.1424, "F"=146.1430,"S"=291.2579)
+phosphoMass<-c("P"=79.96633)
+
+#Upload PTM table in site-specific manner with intensity percentage
+#Import table with information of site, PTM composition, relative intensity, example can be found in the upload "PTM.xlsx" file
+PTM_S01<-read_excel("PTM.xlsx", sheet="S1")%>%
+  mutate(N=as.numeric(str_extract(str_extract(PTM_S01$PTM,"N\\d"),"\\d"))*glycounitMass["N"],
+         H=as.numeric(str_extract(str_extract(PTM_S01$PTM,"H\\d"),"\\d"))*glycounitMass["H"],
+         F=as.numeric(str_extract(str_extract(PTM_S01$PTM,"F\\d"),"\\d"))*glycounitMass["F"],
+         S=as.numeric(str_extract(str_extract(PTM_S01$PTM,"S\\d"),"\\d"))*glycounitMass["S"],
+         P=as.numeric(str_extract(str_extract(PTM_S01$PTM,"P\\d"),"\\d"))*phosphoMass["P"])
+PTM_S01$PTMmass<-rowSums(PTM_S01[,-(1:3)],na.rm=TRUE)
+
+
+#Backbone mass corrected for disulfide bridges and fixed modifications
+backbone<-37177.01
+
+
+#Combinations of different site-specific information
+sites_S01<-split(PTM_S01,PTM_S01$Site) #Split dataframe by the number of modified sites
+#All possible combinations of modified sites
+Calsites_S01<-expand.grid(sites_S01[[1]]$PTM,
+                          sites_S01[[2]]$PTM,
+                          sites_S01[[3]]$PTM,
+                          sites_S01[[4]]$PTM,
+                          sites_S01[[5]]$PTM,
+                          sites_S01[[6]]$PTM,
+                          sites_S01[[7]]$PTM)
+ colnames(Calsites_S01)<-names(sites_S01)
+
+#Calculate the theoretical molecular weight of protein with all possible combinations of modifications
+Calcombination_S01<-expand.grid(sites_S01[[1]]$PTMmass,
+                           sites_S01[[2]]$PTMmass,
+                           sites_S01[[3]]$PTMmass,
+                           sites_S01[[4]]$PTMmass,
+                           sites_S01[[5]]$PTMmass,
+                           sites_S01[[6]]$PTMmass,
+                           sites_S01[[7]]$PTMmass)
+ colnames(Calcombination_S01)<-paste(names(sites_S01),"_mass")
+Calcombination_S01<-Calcombination_S01%>%
+   mutate(CalPTMmass=rowSums(Calcombination_S01,na.rm=TRUE),CalMW=CalPTMmass+backbone)  
+
+#Calculate possibility of proteoform with site-specific occupancies
+Abundance_S01<-expand.grid(sites_S01[[1]]$RelativeAbundance,
+                          sites_S01[[2]]$RelativeAbundance,
+                          sites_S01[[3]]$RelativeAbundance,
+                          sites_S01[[4]]$RelativeAbundance,
+                          sites_S01[[5]]$RelativeAbundance,
+                          sites_S01[[6]]$RelativeAbundance,
+                          sites_S01[[7]]$RelativeAbundance)
+colnames(Abundance_S01)<-paste(names(sites_S01),"_abundance")
+Abundance_S01<-Abundance_S01%>%
+  mutate(totalAbundance=apply(Abundance_S01, 1, prod))
+
+#Make the table with information of all possible site-specific modifications and their possibilities
+AllCombinations_S01<-data.frame(Calsites_S01,Calcombination_S01,Abundance_S01)
+
+#Calculate the m/z of all theoretical proteoforms in certain charge states (choose the most dominant charge states in native spectra)
+AllCombinations_S01<-AllCombinations_S01%>%
+  mutate(mz13=(CalMW+13*1.007276)/13,
+         mz12=(CalMW+12*1.007276)/12,
+         mz11=(CalMW+11*1.007276)/11)
+
+#Annonate peaks in experimental spectrum to the most possible PTM combination with least difference within certain ppm 
+readfindmax<-function(rawdata,caldata,chargetouse,chargenumber,ppm){
+  expdata<-read.table(rawdata,col.names= c("mz","int")) 
+  maxint<-do.call(rbind, lapply(split(caldata,chargetouse), function(x) {return(x[which.max(x$totalAbundance),])}))
+  expmz<-expdata$mz
+  c1 <- c()
+  c2 <- c()
+  
+  for (i in chargetouse){
+    dif <- expmz - i
+    ppmcut <- i * ppm/1000000
+    d<- dif[abs(dif) <= ppmcut] + i # all m/z withtin certain ppm
+    for(j in d){
+      c1 <- append(c1, i)
+      c2 <- append(c2, j)
+    }
+  }
+  output<-data.frame(maxint[match(c1,maxint[,chargenumber]),],expdata[match(c2,expdata$mz),])
+  finaloutput<-do.call(rbind, lapply(split(output,output$mz), function(x) {return(x[which.max(x$totalAbundance),])}))%>%
+    mutate(relint=int/max(int)*100)
+  ppmcal<-finaloutput[,chargenumber]
+  finaloutput$Deltappm<-abs(finaloutput$mz/ppmcal-1)*1000000
+  setnames(finaloutput,"mz",paste("expmz",chargenumber))
+  setnames(finaloutput,"int",paste("int",chargenumber))
+  setnames(finaloutput,"relint",paste("relint",chargenumber))
+  setnames(finaloutput,"Deltappm",paste("Deltappm",chargenumber))
+}
+
+#Import experimental spectrum peak list (example can be found in the upload "S1.txt" file with two columns: m/z, intensity) 
+#Annotate the native peaks and write a table
+S1<-readfindmax("S1.txt",AllCombinations_S01,AllCombinations_S01$mz13,"mz13",100)%>%
+write.csv(("S1_annotation.csv")
